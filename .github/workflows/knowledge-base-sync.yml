@@ -1,0 +1,400 @@
+name: Sync Knowledge Base
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Knowledge base operation to perform'
+        type: choice
+        required: true
+        options:
+          - full_sync
+          - incremental_sync
+          - reindex
+          - validate
+          - backup
+          - restore
+        default: 'incremental_sync'
+      source:
+        description: 'Source of knowledge to ingest'
+        type: choice
+        required: false
+        options:
+          - all
+          - incidents
+          - runbooks
+          - architecture_docs
+          - postmortems
+          - git_history
+        default: 'all'
+      environment:
+        description: 'Target environment'
+        type: choice
+        required: true
+        options:
+          - development
+          - staging
+          - production
+        default: 'staging'
+      collection_name:
+        description: 'ChromaDB collection name'
+        type: string
+        required: false
+        default: 'incidents'
+      force_reindex:
+        description: 'Force full reindex even for incremental sync'
+        type: boolean
+        required: false
+        default: false
+      validate_embeddings:
+        description: 'Validate embedding quality after sync'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sync:
+    name: Sync Knowledge Base
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      OPERATION: ${{ github.event.inputs.operation }}
+      SOURCE: ${{ github.event.inputs.source }}
+      COLLECTION_NAME: ${{ github.event.inputs.collection_name }}
+      FORCE_REINDEX: ${{ github.event.inputs.force_reindex }}
+      VALIDATE_EMBEDDINGS: ${{ github.event.inputs.validate_embeddings }}
+      AWS_REGION: us-east-1
+      NAMESPACE: knowledge-base
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for git_history source
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ai-sre-${{ env.ENVIRONMENT }} --region ${{ env.AWS_REGION }}
+          kubectl config set-context --current --namespace=${{ env.NAMESPACE }}
+
+      - name: Verify cluster access
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Verify ChromaDB
+        run: |
+          if kubectl get deployment chromadb -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "✅ ChromaDB deployed"
+            kubectl rollout status deployment/chromadb -n ${{ env.NAMESPACE }} --timeout=120s
+          else
+            echo "❌ ChromaDB not found. Deploy it first using rca-agent-deploy workflow."
+            exit 1
+          fi
+
+      - name: Build sync configuration
+        id: sync_config
+        run: |
+          cat > /tmp/sync-config.yaml <<EOF
+          operation: ${{ env.OPERATION }}
+          source: ${{ env.SOURCE }}
+          environment: ${{ env.ENVIRONMENT }}
+          collection_name: ${{ env.COLLECTION_NAME }}
+          force_reindex: ${{ env.FORCE_REINDEX }}
+          validate_embeddings: ${{ env.VALIDATE_EMBEDDINGS }}
+          namespace: ${{ env.NAMESPACE }}
+          started_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          workflow_run_id: ${{ github.run_id }}
+          triggered_by: ${{ github.actor }}
+          git_commit: ${{ github.sha }}
+          git_ref: ${{ github.ref }}
+          EOF
+
+          echo "config_path=/tmp/sync-config.yaml" >> $GITHUB_OUTPUT
+          cat /tmp/sync-config.yaml
+
+      - name: Run Knowledge Base Sync
+        run: |
+          python3 - << 'PYEOF'
+          import asyncio
+          import sys
+          import os
+          import yaml
+          import json
+
+          sys.path.insert(0, 'lab-4-rca-command/knowledge-base')
+
+          from vector_store import VectorStore, Document, DocumentType
+          from incident_ingest import IncidentIngester
+          from runbook_parser import RunbookParser
+          from architecture_docs import ArchitectureDocIngester
+
+          async def run_sync():
+              with open('/tmp/sync-config.yaml') as f:
+                  config = yaml.safe_load(f)
+
+              print(f"🔄 Starting Knowledge Base Sync")
+              print(f"   Operation: {config['operation']}")
+              print(f"   Source: {config['source']}")
+              print(f"   Collection: {config['collection_name']}")
+              print(f"   Force Reindex: {config['force_reindex']}")
+              print(f"   Validate Embeddings: {config['validate_embeddings']}")
+
+              # Initialize vector store
+              vector_store = VectorStore(
+                  host="chromadb.knowledge-base.svc.cluster.local",
+                  port=8000,
+                  collection_name=config['collection_name'],
+              )
+
+              results = {
+                  "operation": config['operation'],
+                  "source": config['source'],
+                  "collection": config['collection_name'],
+                  "started_at": config['started_at'],
+                  "documents_processed": 0,
+                  "documents_added": 0,
+                  "documents_updated": 0,
+                  "documents_removed": 0,
+                  "errors": [],
+                  "validation_results": None,
+              }
+
+              if config['operation'] == 'full_sync' or config['operation'] == 'reindex':
+                  print("📦 Performing full sync / reindex...")
+
+                  if config['source'] in ['all', 'incidents']:
+                      print("  Ingesting incidents...")
+                      ingester = IncidentIngester(vector_store)
+                      # Ingest from local files
+                      incident_count = await ingester.ingest_from_directory(
+                          "lab-4-rca-command/knowledge-base/incidents",
+                          force_reindex=config['force_reindex']
+                      )
+                      results['documents_processed'] += incident_count
+                      results['documents_added'] += incident_count
+
+                  if config['source'] in ['all', 'runbooks']:
+                      print("  Parsing runbooks...")
+                      parser = RunbookParser(vector_store)
+                      runbook_count = await parser.ingest_from_directory(
+                          "lab-4-rca-command/knowledge-base/runbooks",
+                          force_reindex=config['force_reindex']
+                      )
+                      results['documents_processed'] += runbook_count
+                      results['documents_added'] += runbook_count
+
+                  if config['source'] in ['all', 'architecture_docs']:
+                      print("  Ingesting architecture docs...")
+                      arch_ingester = ArchitectureDocIngester(vector_store)
+                      arch_count = await arch_ingester.ingest_from_directory(
+                          "lab-4-rca-command/knowledge-base/architecture",
+                          force_reindex=config['force_reindex']
+                      )
+                      results['documents_processed'] += arch_count
+                      results['documents_added'] += arch_count
+
+                  if config['source'] in ['all', 'postmortems']:
+                      print("  Ingesting postmortems...")
+                      ingester = IncidentIngester(vector_store)
+                      postmortem_count = await ingester.ingest_postmortems(
+                          "lab-4-rca-command/knowledge-base/postmortems",
+                          force_reindex=config['force_reindex']
+                      )
+                      results['documents_processed'] += postmortem_count
+                      results['documents_added'] += postmortem_count
+
+                  if config['source'] in ['all', 'git_history']:
+                      print("  Ingesting git history...")
+                      # This would parse git log for incident-related commits
+                      git_count = await vector_store.ingest_git_history(
+                          repo_path=".",
+                          since_days=90,
+                          force_reindex=config['force_reindex']
+                      )
+                      results['documents_processed'] += git_count
+                      results['documents_added'] += git_count
+
+              elif config['operation'] == 'incremental_sync':
+                  print("📥 Performing incremental sync...")
+                  # Incremental sync only processes changed files
+                  if config['source'] in ['all', 'incidents']:
+                      ingester = IncidentIngester(vector_store)
+                      count = await ingester.ingest_incremental(
+                          "lab-4-rca-command/knowledge-base/incidents"
+                      )
+                      results['documents_processed'] += count
+                      results['documents_added'] += count
+
+                  if config['source'] in ['all', 'runbooks']:
+                      parser = RunbookParser(vector_store)
+                      count = await parser.ingest_incremental(
+                          "lab-4-rca-command/knowledge-base/runbooks"
+                      )
+                      results['documents_processed'] += count
+                      results['documents_added'] += count
+
+                  if config['source'] in ['all', 'architecture_docs']:
+                      arch_ingester = ArchitectureDocIngester(vector_store)
+                      count = await arch_ingester.ingest_incremental(
+                          "lab-4-rca-command/knowledge-base/architecture"
+                      )
+                      results['documents_processed'] += count
+                      results['documents_added'] += count
+
+              elif config['operation'] == 'validate':
+                  print("✅ Validating knowledge base...")
+                  validation = await vector_store.validate_collection()
+                  results['validation_results'] = validation
+                  print(f"  Total documents: {validation.get('total_documents', 0)}")
+                  print(f"  Embedding coverage: {validation.get('embedding_coverage', 0):.1%}")
+                  print(f"  Orphaned embeddings: {validation.get('orphaned_embeddings', 0)}")
+                  print(f"  Missing metadata: {validation.get('missing_metadata', 0)}")
+
+              elif config['operation'] == 'backup':
+                  print("💾 Creating knowledge base backup...")
+                  backup_path = f"/tmp/kb-backup-{config['workflow_run_id']}.json"
+                  success = await vector_store.backup(backup_path)
+                  results['backup_path'] = backup_path
+                  results['backup_success'] = success
+                  if success:
+                      print(f"  Backup saved to: {backup_path}")
+
+              elif config['operation'] == 'restore':
+                  print("📂 Restoring knowledge base from backup...")
+                  # Would need backup path as input
+                  results['restore_success'] = False
+                  results['errors'].append("Restore operation requires backup_path parameter")
+
+              # Validate embeddings if requested
+              if config['validate_embeddings'] and config['operation'] != 'validate':
+                  print("🔍 Validating embedding quality...")
+                  validation = await vector_store.validate_collection()
+                  results['validation_results'] = validation
+
+              # Get final collection stats
+              stats = await vector_store.get_collection_stats()
+              results['final_stats'] = stats
+              results['completed_at'] = "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+              print(f"\n✅ Knowledge Base Sync Complete!")
+              print(f"   Documents processed: {results['documents_processed']}")
+              print(f"   Documents added: {results['documents_added']}")
+              print(f"   Documents updated: {results['documents_updated']}")
+              print(f"   Documents removed: {results['documents_removed']}")
+              print(f"   Errors: {len(results['errors'])}")
+
+              if results['validation_results']:
+                  vr = results['validation_results']
+                  print(f"   Total documents in collection: {vr.get('total_documents', 'N/A')}")
+                  print(f"   Embedding coverage: {vr.get('embedding_coverage', 'N/A'):.1%}")
+
+              # Save results
+              with open('/tmp/sync-result.json', 'w') as f:
+                  json.dump(results, f, indent=2, default=str)
+
+              return results
+
+          result = asyncio.run(run_sync())
+          print(f"\nRESULT: {json.dumps(result, indent=2, default=str)}")
+          PYEOF
+
+      - name: Generate Sync Report
+        run: |
+          cat > /tmp/sync-report.md <<EOF
+          # Knowledge Base Sync Report
+
+          **Operation:** ${{ env.OPERATION }}
+          **Source:** ${{ env.SOURCE }}
+          **Environment:** ${{ env.ENVIRONMENT }}
+          **Collection:** ${{ env.COLLECTION_NAME }}
+          **Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Triggered by:** ${{ github.actor }}
+          **Workflow Run:** ${{ github.run_id }}
+          **Git Commit:** ${{ github.sha }}
+
+          ## Configuration
+          - **Force Reindex:** ${{ env.FORCE_REINDEX }}
+          - **Validate Embeddings:** ${{ env.VALIDATE_EMBEDDINGS }}
+
+          ## Results
+          See workflow logs and artifact for detailed results.
+
+          ## Collection Statistics
+          Available in sync-result.json artifact:
+          - Total documents in collection
+          - Embedding coverage percentage
+          - Documents by type (incidents, runbooks, architecture, postmortems)
+          - Embedding quality metrics
+          - Orphaned/missing metadata counts
+
+          ## Next Steps
+          1. Review validation results if embeddings were validated
+          2. Run Shadow Duel exercise to test knowledge base effectiveness
+          3. Run RCA Agent queries to verify search quality
+          4. Schedule regular incremental syncs (daily/weekly)
+          5. Create backup before major changes
+
+          ## Artifacts
+          - Sync results: sync-result.json
+          - Validation details: Included in sync-result.json
+          - Backup file: Available if backup operation was run
+          EOF
+
+          cat /tmp/sync-report.md
+
+      - name: Upload Sync Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: kb-sync-result-${{ env.OPERATION }}-${{ github.run_number }}
+          path: |
+            /tmp/sync-result.json
+            /tmp/sync-report.md
+          retention-days: 30
+
+      - name: Print Summary
+        run: |
+          echo ""
+          echo "=== KNOWLEDGE BASE SYNC COMPLETE ==="
+          echo ""
+          echo "📊 Results uploaded as artifact: kb-sync-result-${{ env.OPERATION }}-${{ github.run_number }}"
+          echo ""
+          echo "=== OPERATION SUMMARY ==="
+          echo "Operation: ${{ env.OPERATION }}"
+          echo "Source: ${{ env.SOURCE }}"
+          echo "Collection: ${{ env.COLLECTION_NAME }}"
+          echo ""
+          echo "=== NEXT STEPS ==="
+          echo "1. Download and review the artifact for detailed results"
+          echo "2. If validation was run, check embedding coverage and quality"
+          echo "3. Test search quality with RCA Agent:"
+          echo "   kubectl port-forward -n rca-system svc/rca-agent 8080:8080"
+          echo "   curl -X POST http://localhost:8080/search -d '{\"query\": \"payment service latency\", \"top_k\": 5}'"
+          echo ""
+          echo "4. Run Shadow Duel to exercise the knowledge base:"
+          echo "   gh workflow run shadow-duel.yml"
+          echo ""
+          echo "=== SCHEDULED SYNC RECOMMENDATIONS ==="
+          echo "  # Daily incremental sync"
+          echo "  gh workflow run knowledge-base-sync.yml -f operation=incremental_sync"
+          echo ""
+          echo "  # Weekly full sync"
+          echo "  gh workflow run knowledge-base-sync.yml -f operation=full_sync"
+          echo ""
+          echo "  # Monthly validation"
+          echo "  gh workflow run knowledge-base-sync.yml -f operation=validate"
+          echo ""
+          echo "  # Quarterly backup"
+          echo "  gh workflow run knowledge-base-sync.yml -f operation=backup"

@@ -1,0 +1,786 @@
+name: Deploy RCA Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment for deployment'
+        type: choice
+        required: true
+        options:
+          - development
+          - staging
+          - production
+        default: 'staging'
+      image_tag:
+        description: 'Docker image tag to deploy (default: latest)'
+        type: string
+        required: false
+        default: 'latest'
+      replicas:
+        description: 'Number of RCA agent replicas'
+        type: string
+        required: false
+        default: '1'
+      namespace:
+        description: 'Kubernetes namespace for deployment'
+        type: string
+        required: false
+        default: 'rca-system'
+      skip_chromadb:
+        description: 'Skip ChromaDB deployment (use existing)'
+        type: boolean
+        required: false
+        default: false
+      skip_grafana:
+        description: 'Skip Grafana deployment (use existing)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy RCA Stack
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      IMAGE_TAG: ${{ github.event.inputs.image_tag }}
+      REPLICAS: ${{ github.event.inputs.replicas }}
+      NAMESPACE: ${{ github.event.inputs.namespace }}
+      SKIP_CHROMADB: ${{ github.event.inputs.skip_chromadb }}
+      SKIP_GRAFANA: ${{ github.event.inputs.skip_grafana }}
+      AWS_REGION: us-east-1
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+      GHCR_REGISTRY: ghcr.io/ramkannans-labs/ai-sre-rca-command
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ai-sre-${{ env.ENVIRONMENT }} --region ${{ env.AWS_REGION }}
+          kubectl config set-context --current --namespace=${{ env.NAMESPACE }}
+
+      - name: Verify cluster access
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace knowledge-base --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Install ChromaDB
+        if: ${{ env.SKIP_CHROMADB == 'false' }}
+        run: |
+          helm repo add chromadb https://chromadb.github.io/helm-charts 2>/dev/null || true
+          helm repo update
+
+          cat > /tmp/chromadb-values.yaml <<EOF
+          persistence:
+            enabled: true
+            size: 10Gi
+            storageClass: gp3
+          resources:
+            limits:
+              cpu: 2000m
+              memory: 4Gi
+            requests:
+              cpu: 500m
+              memory: 2Gi
+          service:
+            type: ClusterIP
+            port: 8000
+          ingress:
+            enabled: false
+          env:
+            - name: CHROMA_SERVER_HOST
+              value: "0.0.0.0"
+            - name: CHROMA_SERVER_HTTP_PORT
+              value: "8000"
+            - name: ALLOW_RESET
+              value: "TRUE"
+            - name: ANONYMIZED_TELEMETRY
+              value: "FALSE"
+          auth:
+            enabled: false
+          EOF
+
+          helm upgrade --install chromadb chromadb/chromadb \
+            --namespace knowledge-base \
+            --values /tmp/chromadb-values.yaml \
+            --wait --timeout 5m
+
+      - name: Install Grafana
+        if: ${{ env.SKIP_GRAFANA == 'false' }}
+        run: |
+          helm repo add grafana https://grafana.github.io/helm-charts 2>/dev/null || true
+          helm repo update
+
+          cat > /tmp/grafana-values.yaml <<EOF
+          persistence:
+            enabled: true
+            size: 5Gi
+            storageClass: gp3
+          adminUser: admin
+          adminPassword: "admin123"
+          service:
+            type: ClusterIP
+            port: 3000
+          ingress:
+            enabled: false
+          datasources:
+            datasources.yaml:
+              apiVersion: 1
+              datasources:
+                - name: Prometheus
+                  type: prometheus
+                  url: http://prometheus-operated.monitoring:9090
+                  access: proxy
+                  isDefault: true
+                - name: Loki
+                  type: loki
+                  url: http://loki.monitoring:3100
+                  access: proxy
+                - name: Tempo
+                  type: tempo
+                  url: http://tempo.monitoring:3200
+                  access: proxy
+          dashboardProviders:
+            dashboardproviders.yaml:
+              apiVersion: 1
+              providers:
+                - name: 'RCA Dashboards'
+                  orgId: 1
+                  folder: 'RCA Command'
+                  type: file
+                  disableDeletion: false
+                  updateIntervalSeconds: 10
+                  allowUiUpdates: true
+                  options:
+                    path: /var/lib/grafana/dashboards/rca
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              folder: /tmp/dashboards
+              provider:
+                foldersFromFilesStructure: true
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          EOF
+
+          helm upgrade --install grafana grafana/grafana \
+            --namespace monitoring \
+            --values /tmp/grafana-values.yaml \
+            --wait --timeout 5m
+
+      - name: Deploy RCA Agent
+        run: |
+          cat > /tmp/rca-agent-deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: rca-agent
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: rca-agent
+              component: ai-rca
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: rca-agent
+            template:
+              metadata:
+                labels:
+                  app: rca-agent
+                  component: ai-rca
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8080"
+                  prometheus.io/path: "/metrics"
+              spec:
+                serviceAccountName: rca-agent
+                containers:
+                  - name: rca-agent
+                    image: ${{ env.GHCR_REGISTRY }}/rca-agent:${{ env.IMAGE_TAG }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8080
+                        name: http
+                    env:
+                      - name: CHROMADB_HOST
+                        value: "chromadb.knowledge-base.svc.cluster.local"
+                      - name: CHROMADB_PORT
+                        value: "8000"
+                      - name: PROMETHEUS_URL
+                        value: "http://prometheus-operated.monitoring:9090"
+                      - name: LOKI_URL
+                        value: "http://loki.monitoring:3100"
+                      - name: TEMPO_URL
+                        value: "http://tempo.monitoring:3200"
+                      - name: MCP_SERVER_URL
+                        value: "http://mcp-server.monitoring.svc.cluster.local:8000"
+                      - name: KNOWLEDGE_BASE_COLLECTION
+                        value: "incidents"
+                      - name: LOG_LEVEL
+                        value: "INFO"
+                    resources:
+                      limits:
+                        cpu: "2000m"
+                        memory: "4Gi"
+                      requests:
+                        cpu: "500m"
+                        memory: "1Gi"
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 8080
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 8080
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: rca-agent
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: rca-agent
+            ports:
+              - port: 8080
+                targetPort: 8080
+                name: http
+            type: ClusterIP
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: rca-agent
+            namespace: ${{ env.NAMESPACE }}
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: rca-agent
+            namespace: ${{ env.NAMESPACE }}
+          rules:
+            - apiGroups: [""]
+              resources: ["pods", "services", "configmaps", "events"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: ["apps"]
+              resources: ["deployments", "replicasets", "statefulsets"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: ["networking.k8s.io"]
+              resources: ["networkpolicies", "ingresses"]
+              verbs: ["get", "list", "watch"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: rca-agent
+            namespace: ${{ env.NAMESPACE }}
+          subjects:
+            - kind: ServiceAccount
+              name: rca-agent
+              namespace: ${{ env.NAMESPACE }}
+          roleRef:
+            kind: Role
+            name: rca-agent
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+          kubectl apply -f /tmp/rca-agent-deployment.yaml
+
+      - name: Deploy Incident Command API
+        run: |
+          cat > /tmp/incident-command-deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: incident-command-api
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: incident-command-api
+              component: ics
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: incident-command-api
+            template:
+              metadata:
+                labels:
+                  app: incident-command-api
+                  component: ics
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8081"
+                  prometheus.io/path: "/metrics"
+              spec:
+                serviceAccountName: incident-command
+                containers:
+                  - name: incident-command-api
+                    image: ${{ env.GHCR_REGISTRY }}/incident-command:${{ env.IMAGE_TAG }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8081
+                        name: http
+                    env:
+                      - name: CHROMADB_HOST
+                        value: "chromadb.knowledge-base.svc.cluster.local"
+                      - name: CHROMADB_PORT
+                        value: "8000"
+                      - name: RCA_AGENT_URL
+                        value: "http://rca-agent.${{ env.NAMESPACE }}.svc.cluster.local:8080"
+                      - name: SLACK_WEBHOOK_URL
+                        valueFrom:
+                          secretKeyRef:
+                            name: ics-secrets
+                            key: slack-webhook
+                            optional: true
+                      - name: PAGERDUTY_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: ics-secrets
+                            key: pagerduty-key
+                            optional: true
+                      - name: ZOOM_API_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: ics-secrets
+                            key: zoom-api-key
+                            optional: true
+                      - name: ZOOM_API_SECRET
+                        valueFrom:
+                          secretKeyRef:
+                            name: ics-secrets
+                            key: zoom-api-secret
+                            optional: true
+                      - name: STATUSPAGE_API_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: ics-secrets
+                            key: statuspage-api-key
+                            optional: true
+                      - name: STATUSPAGE_PAGE_ID
+                        valueFrom:
+                          secretKeyRef:
+                            name: ics-secrets
+                            key: statuspage-page-id
+                            optional: true
+                    resources:
+                      limits:
+                        cpu: "1000m"
+                        memory: "2Gi"
+                      requests:
+                        cpu: "250m"
+                        memory: "512Mi"
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 8081
+                      initialDelaySeconds: 20
+                      periodSeconds: 10
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 8081
+                      initialDelaySeconds: 10
+                      periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: incident-command-api
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: incident-command-api
+            ports:
+              - port: 8081
+                targetPort: 8081
+                name: http
+            type: ClusterIP
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: incident-command
+            namespace: ${{ env.NAMESPACE }}
+          ---
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: ics-secrets
+            namespace: ${{ env.NAMESPACE }}
+          type: Opaque
+          stringData:
+            slack-webhook: ""
+            pagerduty-key: ""
+            zoom-api-key: ""
+            zoom-api-secret: ""
+            statuspage-api-key: ""
+            statuspage-page-id: ""
+          EOF
+
+          kubectl apply -f /tmp/incident-command-deployment.yaml
+
+      - name: Deploy Shadow Duel Orchestrator
+        run: |
+          cat > /tmp/shadow-duel-deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: shadow-duel-orchestrator
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: shadow-duel-orchestrator
+              component: training
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: shadow-duel-orchestrator
+            template:
+              metadata:
+                labels:
+                  app: shadow-duel-orchestrator
+                  component: training
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8082"
+                  prometheus.io/path: "/metrics"
+              spec:
+                serviceAccountName: shadow-duel
+                containers:
+                  - name: shadow-duel-orchestrator
+                    image: ${{ env.GHCR_REGISTRY }}/shadow-duel:${{ env.IMAGE_TAG }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8082
+                        name: http
+                    env:
+                      - name: CHROMADB_HOST
+                        value: "chromadb.knowledge-base.svc.cluster.local"
+                      - name: CHROMADB_PORT
+                        value: "8000"
+                      - name: SCENARIO_ENGINE_URL
+                        value: "http://scenario-engine.${{ env.NAMESPACE }}.svc.cluster.local:8083"
+                      - name: METRICS_COLLECTOR_URL
+                        value: "http://metrics-collector.${{ env.NAMESPACE }}.svc.cluster.local:8084"
+                      - name: RCA_AGENT_URL
+                        value: "http://rca-agent.${{ env.NAMESPACE }}.svc.cluster.local:8080"
+                    resources:
+                      limits:
+                        cpu: "1000m"
+                        memory: "2Gi"
+                      requests:
+                        cpu: "250m"
+                        memory: "512Mi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: shadow-duel-orchestrator
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: shadow-duel-orchestrator
+            ports:
+              - port: 8082
+                targetPort: 8082
+                name: http
+            type: ClusterIP
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: shadow-duel
+            namespace: ${{ env.NAMESPACE }}
+          EOF
+
+          kubectl apply -f /tmp/shadow-duel-deployment.yaml
+
+      - name: Deploy Scenario Engine
+        run: |
+          cat > /tmp/scenario-engine-deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: scenario-engine
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: scenario-engine
+              component: simulation
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: scenario-engine
+            template:
+              metadata:
+                labels:
+                  app: scenario-engine
+                  component: simulation
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8083"
+                  prometheus.io/path: "/metrics"
+              spec:
+                serviceAccountName: scenario-engine
+                containers:
+                  - name: scenario-engine
+                    image: ${{ env.GHCR_REGISTRY }}/scenario-engine:${{ env.IMAGE_TAG }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8083
+                        name: http
+                    env:
+                      - name: KUBECONFIG
+                        value: "/etc/kubeconfig/kubeconfig"
+                    volumeMounts:
+                      - name: kubeconfig
+                        mountPath: /etc/kubeconfig
+                        readOnly: true
+                    resources:
+                      limits:
+                        cpu: "2000m"
+                        memory: "2Gi"
+                      requests:
+                        cpu: "500m"
+                        memory: "1Gi"
+                volumes:
+                  - name: kubeconfig
+                    secret:
+                      secretName: scenario-engine-kubeconfig
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: scenario-engine
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: scenario-engine
+            ports:
+              - port: 8083
+                targetPort: 8083
+                name: http
+            type: ClusterIP
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: scenario-engine
+            namespace: ${{ env.NAMESPACE }}
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: scenario-engine
+          rules:
+            - apiGroups: [""]
+              resources: ["pods", "pods/exec", "services", "configmaps", "namespaces"]
+              verbs: ["get", "list", "watch", "create", "delete", "patch"]
+            - apiGroups: ["apps"]
+              resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+              verbs: ["get", "list", "watch", "create", "delete", "patch", "update"]
+            - apiGroups: ["batch"]
+              resources: ["jobs", "cronjobs"]
+              verbs: ["get", "list", "watch", "create", "delete"]
+            - apiGroups: ["networking.k8s.io"]
+              resources: ["networkpolicies", "ingresses"]
+              verbs: ["get", "list", "watch", "create", "delete", "patch"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: scenario-engine
+          subjects:
+            - kind: ServiceAccount
+              name: scenario-engine
+              namespace: ${{ env.NAMESPACE }}
+          roleRef:
+            kind: ClusterRole
+            name: scenario-engine
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+          kubectl apply -f /tmp/scenario-engine-deployment.yaml
+
+      - name: Deploy Metrics Collector
+        run: |
+          cat > /tmp/metrics-collector-deployment.yaml <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: metrics-collector
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: metrics-collector
+              component: training
+          spec:
+            replicas: ${{ env.REPLICAS }}
+            selector:
+              matchLabels:
+                app: metrics-collector
+            template:
+              metadata:
+                labels:
+                  app: metrics-collector
+                  component: training
+                annotations:
+                  prometheus.io/scrape: "true"
+                  prometheus.io/port: "8084"
+                  prometheus.io/path: "/metrics"
+              spec:
+                serviceAccountName: metrics-collector
+                containers:
+                  - name: metrics-collector
+                    image: ${{ env.GHCR_REGISTRY }}/metrics-collector:${{ env.IMAGE_TAG }}
+                    imagePullPolicy: Always
+                    ports:
+                      - containerPort: 8084
+                        name: http
+                    env:
+                      - name: CHROMADB_HOST
+                        value: "chromadb.knowledge-base.svc.cluster.local"
+                      - name: CHROMADB_PORT
+                        value: "8000"
+                      - name: PROMETHEUS_URL
+                        value: "http://prometheus-operated.monitoring:9090"
+                    resources:
+                      limits:
+                        cpu: "1000m"
+                        memory: "2Gi"
+                      requests:
+                        cpu: "250m"
+                        memory: "512Mi"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: metrics-collector
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: metrics-collector
+            ports:
+              - port: 8084
+                targetPort: 8084
+                name: http
+            type: ClusterIP
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: metrics-collector
+            namespace: ${{ env.NAMESPACE }}
+          EOF
+
+          kubectl apply -f /tmp/metrics-collector-deployment.yaml
+
+      - name: Install Grafana Dashboards
+        run: |
+          DASHBOARD_DIR="lab-4-rca-command/dashboards"
+          if [ -d "$DASHBOARD_DIR" ]; then
+            for dashboard in "$DASHBOARD_DIR"/*.json; do
+              if [ -f "$dashboard" ]; then
+                name=$(basename "$dashboard" .json)
+                kubectl create configmap "grafana-dashboard-$name" \
+                  --from-file="$dashboard" \
+                  --namespace monitoring \
+                  --dry-run=client -o yaml | kubectl apply -f -
+                kubectl label configmap "grafana-dashboard-$name" \
+                  grafana_dashboard=1 \
+                  --namespace monitoring \
+                  --overwrite
+              fi
+            done
+            echo "Grafana dashboards installed"
+          else
+            echo "Dashboard directory not found: $DASHBOARD_DIR"
+          fi
+
+      - name: Wait for deployments to be ready
+        run: |
+          for deployment in rca-agent incident-command-api shadow-duel-orchestrator scenario-engine metrics-collector; do
+            echo "Waiting for $deployment..."
+            kubectl rollout status deployment/$deployment -n ${{ env.NAMESPACE }} --timeout=300s
+          done
+
+      - name: Verify deployment
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get deployments -n ${{ env.NAMESPACE }}
+          echo ""
+          echo "=== Pod Status ==="
+          kubectl get pods -n ${{ env.NAMESPACE }}
+          echo ""
+          echo "=== Services ==="
+          kubectl get svc -n ${{ env.NAMESPACE }}
+          echo ""
+          echo "=== ChromaDB ==="
+          kubectl get deployment chromadb -n knowledge-base
+          echo ""
+          echo "=== Grafana ==="
+          kubectl get deployment grafana -n monitoring
+
+      - name: Print access information
+        run: |
+          echo ""
+          echo "=== ACCESS INFORMATION ==="
+          echo ""
+          echo "To access services, use kubectl port-forward:"
+          echo ""
+          echo "  # RCA Agent API"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/rca-agent 8080:8080"
+          echo ""
+          echo "  # Incident Command API"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/incident-command-api 8081:8081"
+          echo ""
+          echo "  # Shadow Duel Orchestrator"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/shadow-duel-orchestrator 8082:8082"
+          echo ""
+          echo "  # Scenario Engine"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/scenario-engine 8083:8083"
+          echo ""
+          echo "  # Metrics Collector"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/metrics-collector 8084:8084"
+          echo ""
+          echo "  # ChromaDB"
+          echo "  kubectl port-forward -n knowledge-base svc/chromadb 8000:8000"
+          echo ""
+          echo "  # Grafana (admin/admin123)"
+          echo "  kubectl port-forward -n monitoring svc/grafana 3000:3000"
+          echo ""
+          echo "NOTE: Update secrets in namespace ${{ env.NAMESPACE }} (ics-secrets) with actual credentials for Slack, PagerDuty, Zoom, StatusPage"

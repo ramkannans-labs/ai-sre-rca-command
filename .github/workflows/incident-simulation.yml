@@ -1,0 +1,338 @@
+name: Run Incident Simulation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Incident scenario to simulate'
+        type: choice
+        required: true
+        options:
+          - payment-latency-spike
+          - checkout-cascade-failure
+          - database-connection-exhaustion
+          - kafka-consumer-lag
+          - memory-leak-orders-service
+          - network-partition-east-west
+          - dns-resolution-failure
+          - clock-drift-synchronization
+        default: 'payment-latency-spike'
+      severity:
+        description: 'Incident severity level'
+        type: choice
+        required: true
+        options:
+          - sev-1
+          - sev-2
+          - sev-3
+        default: 'sev-2'
+      environment:
+        description: 'Target environment'
+        type: choice
+        required: true
+        options:
+          - development
+          - staging
+          - production
+        default: 'staging'
+      duration_minutes:
+        description: 'Simulation duration in minutes'
+        type: string
+        required: false
+        default: '30'
+      inject_failures:
+        description: 'Comma-separated list of failure types to inject'
+        type: string
+        required: false
+        default: 'latency,error'
+      target_services:
+        description: 'Comma-separated list of target services (empty = all)'
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: 'Run in dry-run mode (no actual failures injected)'
+        type: boolean
+        required: false
+        default: false
+      capture_metrics:
+        description: 'Capture detailed metrics during simulation'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  simulate:
+    name: Run Incident Simulation
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      SCENARIO: ${{ github.event.inputs.scenario }}
+      SEVERITY: ${{ github.event.inputs.severity }}
+      DURATION_MINUTES: ${{ github.event.inputs.duration_minutes }}
+      INJECT_FAILURES: ${{ github.event.inputs.inject_failures }}
+      TARGET_SERVICES: ${{ github.event.inputs.target_services }}
+      DRY_RUN: ${{ github.event.inputs.dry_run }}
+      CAPTURE_METRICS: ${{ github.event.inputs.capture_metrics }}
+      AWS_REGION: us-east-1
+      NAMESPACE: rca-system
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ai-sre-${{ env.ENVIRONMENT }} --region ${{ env.AWS_REGION }}
+          kubectl config set-context --current --namespace=${{ env.NAMESPACE }}
+
+      - name: Verify cluster access
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Build simulation configuration
+        id: sim_config
+        run: |
+          cat > /tmp/simulation-config.yaml <<EOF
+          scenario: ${{ env.SCENARIO }}
+          severity: ${{ env.SEVERITY }}
+          environment: ${{ env.ENVIRONMENT }}
+          duration_minutes: ${{ env.DURATION_MINUTES }}
+          inject_failures: "${{ env.INJECT_FAILURES }}"
+          target_services: "${{ env.TARGET_SERVICES }}"
+          dry_run: ${{ env.DRY_RUN }}
+          capture_metrics: ${{ env.CAPTURE_METRICS }}
+          namespace: ${{ env.NAMESPACE }}
+          started_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          EOF
+
+          echo "config_path=/tmp/simulation-config.yaml" >> $GITHUB_OUTPUT
+          cat /tmp/simulation-config.yaml
+
+      - name: Deploy Scenario Engine (if not running)
+        run: |
+          if ! kubectl get deployment scenario-engine -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "Scenario Engine not found, deploying..."
+            kubectl apply -f lab-4-rca-command/scripts/k8s/scenario-engine-deployment.yaml
+            kubectl rollout status deployment/scenario-engine -n ${{ env.NAMESPACE }} --timeout=120s
+          else
+            echo "Scenario Engine already running"
+          fi
+
+      - name: Deploy Metrics Collector (if not running)
+        run: |
+          if ! kubectl get deployment metrics-collector -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "Metrics Collector not found, deploying..."
+            kubectl apply -f lab-4-rca-command/scripts/k8s/metrics-collector-deployment.yaml
+            kubectl rollout status deployment/metrics-collector -n ${{ env.NAMESPACE }} --timeout=120s
+          else
+            echo "Metrics Collector already running"
+          fi
+
+      - name: Run Incident Simulation
+        run: |
+          python3 - << 'PYEOF'
+          import asyncio
+          import sys
+          import os
+          import yaml
+
+          sys.path.insert(0, 'lab-4-rca-command/simulation')
+
+          from scenario_engine import ScenarioEngine, FailureType, FailureSpec, ScenarioSpec
+
+          async def run_simulation():
+              with open('/tmp/simulation-config.yaml') as f:
+                  config = yaml.safe_load(f)
+
+              # Parse failure types
+              failure_map = {
+                  'latency': FailureType.LATENCY_SPIKE,
+                  'error': FailureType.ERROR_RATE,
+                  'cpu': FailureType.CPU_EXHAUSTION,
+                  'memory': FailureType.MEMORY_LEAK,
+                  'network': FailureType.NETWORK_PARTITION,
+                  'dns': FailureType.DNS_FAILURE,
+                  'clock': FailureType.CLOCK_DRIFT,
+                  'pod_crash': FailureType.POD_CRASH,
+              }
+
+              inject_types = [f.strip() for f in config['inject_failures'].split(',')]
+              failure_types = [failure_map.get(f, FailureType.LATENCY_SPIKE) for f in inject_types]
+
+              # Parse target services
+              target_services = None
+              if config['target_services']:
+                  target_services = [s.strip() for s in config['target_services'].split(',')]
+
+              # Create scenario
+              scenario_spec = ScenarioSpec(
+                  name=config['scenario'],
+                  description=f"Simulated {config['severity']} incident: {config['scenario']}",
+                  duration_seconds=config['duration_minutes'] * 60,
+                  failure_sequence=[],
+                  target_services=target_services,
+                  expected_impact={
+                      'severity': config['severity'],
+                      'failure_types': [f.value for f in failure_types],
+                  },
+                  detection_criteria={
+                      'error_rate_threshold': 0.05,
+                      'latency_p99_threshold_ms': 1000,
+                  },
+                  runbook_ref=f"runbooks/{config['scenario']}.md",
+              )
+
+              # Generate failure sequence
+              from datetime import datetime, timedelta
+              start_time = datetime.utcnow()
+
+              for i, failure_type in enumerate(failure_types):
+                  failure = FailureSpec(
+                      failure_type=failure_type,
+                      target_service=target_services[0] if target_services else None,
+                      intensity=0.5 + (i * 0.1),
+                      duration_seconds=config['duration_minutes'] * 60 // len(failure_types),
+                      start_delay_seconds=i * 30,
+                      parameters={},
+                  )
+                  scenario_spec.failure_sequence.append(failure)
+
+              # Run scenario
+              engine = ScenarioEngine(
+                  namespace=config['namespace'],
+                  kubeconfig_path=None,
+              )
+
+              if config['dry_run']:
+                  print("🔍 DRY RUN MODE - No actual failures will be injected")
+                  print(f"Scenario: {scenario_spec.name}")
+                  print(f"Duration: {scenario_spec.duration_seconds}s")
+                  print(f"Failures: {len(scenario_spec.failure_sequence)}")
+                  for f in scenario_spec.failure_sequence:
+                      print(f"  - {f.failure_type.value} on {f.target_service or 'all'} for {f.duration_seconds}s")
+                  return {"status": "dry_run_complete", "scenario": scenario_spec.name}
+
+              print(f"🚀 Starting incident simulation: {config['scenario']}")
+              result = await engine.run_scenario(scenario_spec)
+
+              print(f"✅ Simulation completed: {result.status}")
+              print(f"Duration: {result.actual_duration_seconds}s")
+              print(f"Failures injected: {result.failures_injected}")
+              print(f"Metrics collected: {len(result.metrics_collected)}")
+
+              return {
+                  "status": result.status,
+                  "scenario": config['scenario'],
+                  "duration": result.actual_duration_seconds,
+                  "failures_injected": result.failures_injected,
+                  "metrics_count": len(result.metrics_collected),
+              }
+
+          result = asyncio.run(run_simulation())
+          print(f"RESULT: {result}")
+          PYEOF
+
+      - name: Collect Simulation Metrics
+        if: ${{ env.CAPTURE_METRICS == 'true' }}
+        run: |
+          echo "📊 Collecting simulation metrics..."
+
+          # Wait a moment for metrics to be available
+          sleep 10
+
+          # Query Prometheus for key metrics during simulation window
+          PROM_URL="http://prometheus-operated.monitoring:9090"
+
+          # Get error rate metrics
+          kubectl run prom-query --rm -i --restart=Never \
+            --image=curlimages/curl:8.6.0 \
+            --namespace=${{ env.NAMESPACE }} \
+            -- curl -s "${PROM_URL}/api/v1/query?query=rate(http_requests_total{status=~\"5..\"}[5m])" \
+            | jq '.data.result | length' || echo "No error rate data"
+
+          # Get latency metrics
+          kubectl run prom-query-latency --rm -i --restart=Never \
+            --image=curlimages/curl:8.6.0 \
+            --namespace=${{ env.NAMESPACE }} \
+            -- curl -s "${PROM_URL}/api/v1/query?query=histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))" \
+            | jq '.data.result | length' || echo "No latency data"
+
+          # Get pod restart counts
+          kubectl get pods -n ${{ env.NAMESPACE }} -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].restartCount}{"\n"}{end}' \
+            | sort -k2 -nr | head -20
+
+      - name: Generate Simulation Report
+        run: |
+          cat > /tmp/simulation-report.md <<EOF
+          # Incident Simulation Report
+
+          **Scenario:** ${{ env.SCENARIO }}
+          **Severity:** ${{ env.SEVERITY }}
+          **Environment:** ${{ env.ENVIRONMENT }}
+          **Duration:** ${{ env.DURATION_MINUTES }} minutes
+          **Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Triggered by:** ${{ github.actor }}
+          **Workflow Run:** ${{ github.run_id }}
+
+          ## Configuration
+          - **Failure Types:** ${{ env.INJECT_FAILURES }}
+          - **Target Services:** ${{ env.TARGET_SERVICES || 'All services' }}
+          - **Dry Run:** ${{ env.DRY_RUN }}
+          - **Metrics Capture:** ${{ env.CAPTURE_METRICS }}
+
+          ## Results
+          See workflow logs for detailed output.
+
+          ## Next Steps
+          1. Review RCA Agent analysis of this incident
+          2. Run Shadow Duel exercise to compare human vs AI investigation
+          3. Update runbooks based on findings
+          4. Document lessons learned in knowledge base
+
+          ## Artifacts
+          - Simulation configuration: simulation-config.yaml
+          - Metrics data: Available in Prometheus/Grafana
+          - RCA analysis: Run rca-agent workflow
+          EOF
+
+          cat /tmp/simulation-report.md
+
+      - name: Upload Simulation Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulation-report-${{ env.SCENARIO }}-${{ github.run_number }}
+          path: /tmp/simulation-report.md
+          retention-days: 30
+
+      - name: Print Access Information
+        run: |
+          echo ""
+          echo "=== INCIDENT SIMULATION COMPLETE ==="
+          echo ""
+          echo "To investigate this incident:"
+          echo ""
+          echo "  # Run RCA Agent analysis"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/rca-agent 8080:8080"
+          echo "  curl -X POST http://localhost:8080/analyze -d '{\"incident_id\": \"sim-${{ env.SCENARIO }}-${{ github.run_number }}\"}'"
+          echo ""
+          echo "  # Start Shadow Duel exercise"
+          echo "  kubectl port-forward -n ${{ env.NAMESPACE }} svc/shadow-duel-orchestrator 8082:8082"
+          echo "  curl -X POST http://localhost:8082/duel/start -d '{\"scenario\": \"${{ env.SCENARIO }}\", \"severity\": \"${{ env.SEVERITY }}\"}'"
+          echo ""
+          echo "  # View metrics in Grafana"
+          echo "  kubectl port-forward -n monitoring svc/grafana 3000:3000"
+          echo "  # Dashboard: RCA Command / Incident Analysis"

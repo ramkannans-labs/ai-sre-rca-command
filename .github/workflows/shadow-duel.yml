@@ -1,0 +1,406 @@
+name: Run Shadow Duel Exercise
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: 'Scenario for Shadow Duel'
+        type: choice
+        required: true
+        options:
+          - payment-latency-spike
+          - checkout-cascade-failure
+          - database-connection-exhaustion
+          - kafka-consumer-lag
+          - memory-leak-orders-service
+          - network-partition-east-west
+          - dns-resolution-failure
+          - clock-drift-synchronization
+        default: 'payment-latency-spike'
+      severity:
+        description: 'Incident severity level'
+        type: choice
+        required: true
+        options:
+          - sev-1
+          - sev-2
+          - sev-3
+        default: 'sev-2'
+      environment:
+        description: 'Target environment'
+        type: choice
+        required: true
+        options:
+          - development
+          - staging
+          - production
+        default: 'staging'
+      duration_minutes:
+        description: 'Duration of the Shadow Duel exercise in minutes'
+        type: string
+        required: false
+        default: '45'
+      human_investigators:
+        description: 'Number of human investigators (1-3)'
+        type: string
+        required: false
+        default: '1'
+      ai_agents:
+        description: 'Number of AI agents to run in parallel (1-3)'
+        type: string
+        required: false
+        default: '1'
+      enable_ics:
+        description: 'Enable Incident Command System roles'
+        type: boolean
+        required: false
+        default: true
+      capture_timeline:
+        description: 'Capture detailed investigation timeline'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  shadow_duel:
+    name: Run Shadow Duel Exercise
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      SCENARIO: ${{ github.event.inputs.scenario }}
+      SEVERITY: ${{ github.event.inputs.severity }}
+      DURATION_MINUTES: ${{ github.event.inputs.duration_minutes }}
+      HUMAN_INVESTIGATORS: ${{ github.event.inputs.human_investigators }}
+      AI_AGENTS: ${{ github.event.inputs.ai_agents }}
+      ENABLE_ICS: ${{ github.event.inputs.enable_ics }}
+      CAPTURE_TIMELINE: ${{ github.event.inputs.capture_timeline }}
+      AWS_REGION: us-east-1
+      NAMESPACE: rca-system
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ai-sre-${{ env.ENVIRONMENT }} --region ${{ env.AWS_REGION }}
+          kubectl config set-context --current --namespace=${{ env.NAMESPACE }}
+
+      - name: Verify cluster access
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Verify prerequisites
+        run: |
+          echo "🔍 Checking prerequisites for Shadow Duel..."
+
+          # Check RCA Agent
+          if kubectl get deployment rca-agent -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "✅ RCA Agent deployed"
+            kubectl rollout status deployment/rca-agent -n ${{ env.NAMESPACE }} --timeout=60s
+          else
+            echo "❌ RCA Agent not found. Deploy it first using rca-agent-deploy workflow."
+            exit 1
+          fi
+
+          # Check Shadow Duel Orchestrator
+          if kubectl get deployment shadow-duel-orchestrator -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "✅ Shadow Duel Orchestrator deployed"
+            kubectl rollout status deployment/shadow-duel-orchestrator -n ${{ env.NAMESPACE }} --timeout=60s
+          else
+            echo "❌ Shadow Duel Orchestrator not found. Deploy it first using rca-agent-deploy workflow."
+            exit 1
+          fi
+
+          # Check Scenario Engine
+          if kubectl get deployment scenario-engine -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "✅ Scenario Engine deployed"
+            kubectl rollout status deployment/scenario-engine -n ${{ env.NAMESPACE }} --timeout=60s
+          else
+            echo "❌ Scenario Engine not found. Deploy it first using rca-agent-deploy workflow."
+            exit 1
+          fi
+
+          # Check Metrics Collector
+          if kubectl get deployment metrics-collector -n ${{ env.NAMESPACE }} &>/dev/null; then
+            echo "✅ Metrics Collector deployed"
+            kubectl rollout status deployment/metrics-collector -n ${{ env.NAMESPACE }} --timeout=60s
+          else
+            echo "❌ Metrics Collector not found. Deploy it first using rca-agent-deploy workflow."
+            exit 1
+          fi
+
+          # Check ChromaDB
+          if kubectl get deployment chromadb -n knowledge-base &>/dev/null; then
+            echo "✅ ChromaDB (Knowledge Base) deployed"
+            kubectl rollout status deployment/chromadb -n knowledge-base --timeout=60s
+          else
+            echo "❌ ChromaDB not found. Deploy it first using rca-agent-deploy workflow."
+            exit 1
+          fi
+
+          # Check Incident Command API
+          if [[ "${{ env.ENABLE_ICS }}" == "true" ]]; then
+            if kubectl get deployment incident-command-api -n ${{ env.NAMESPACE }} &>/dev/null; then
+              echo "✅ Incident Command API deployed"
+              kubectl rollout status deployment/incident-command-api -n ${{ env.NAMESPACE }} --timeout=60s
+            else
+              echo "❌ Incident Command API not found. Deploy it first using rca-agent-deploy workflow."
+              exit 1
+            fi
+          fi
+
+      - name: Build Shadow Duel configuration
+        id: duel_config
+        run: |
+          cat > /tmp/shadow-duel-config.yaml <<EOF
+          scenario: ${{ env.SCENARIO }}
+          severity: ${{ env.SEVERITY }}
+          environment: ${{ env.ENVIRONMENT }}
+          duration_minutes: ${{ env.DURATION_MINUTES }}
+          human_investigators: ${{ env.HUMAN_INVESTIGATORS }}
+          ai_agents: ${{ env.AI_AGENTS }}
+          enable_ics: ${{ env.ENABLE_ICS }}
+          capture_timeline: ${{ env.CAPTURE_TIMELINE }}
+          namespace: ${{ env.NAMESPACE }}
+          started_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          workflow_run_id: ${{ github.run_id }}
+          triggered_by: ${{ github.actor }}
+          EOF
+
+          echo "config_path=/tmp/shadow-duel-config.yaml" >> $GITHUB_OUTPUT
+          cat /tmp/shadow-duel-config.yaml
+
+      - name: Run Shadow Duel Exercise
+        run: |
+          python3 - << 'PYEOF'
+          import asyncio
+          import sys
+          import os
+          import yaml
+          import json
+
+          sys.path.insert(0, 'lab-4-rca-command/simulation')
+
+          from shadow_duel import ShadowDuelOrchestrator, DuelConfig, ParticipantType
+          from scenario_engine import ScenarioEngine, ScenarioSpec, FailureType, FailureSpec
+
+          async def run_shadow_duel():
+              with open('/tmp/shadow-duel-config.yaml') as f:
+                  config = yaml.safe_load(f)
+
+              # Create duel configuration
+              duel_config = DuelConfig(
+                  scenario_name=config['scenario'],
+                  severity=config['severity'],
+                  duration_seconds=config['duration_minutes'] * 60,
+                  human_investigators=config['human_investigators'],
+                  ai_agents=config['ai_agents'],
+                  enable_ics=config['enable_ics'],
+                  capture_timeline=config['capture_timeline'],
+                  namespace=config['namespace'],
+              )
+
+              # Create scenario for the duel
+              scenario_spec = ScenarioSpec(
+                  name=config['scenario'],
+                  description=f"Shadow Duel: {config['severity']} incident - {config['scenario']}",
+                  duration_seconds=config['duration_minutes'] * 60,
+                  failure_sequence=[],
+                  target_services=None,
+                  expected_impact={
+                      'severity': config['severity'],
+                  },
+                  detection_criteria={},
+                  runbook_ref=f"runbooks/{config['scenario']}.md",
+              )
+
+              # Add a standard failure sequence for the scenario
+              failure_types = [
+                  FailureType.LATENCY_SPIKE,
+                  FailureType.ERROR_RATE,
+              ]
+
+              from datetime import datetime
+              start_time = datetime.utcnow()
+
+              for i, failure_type in enumerate(failure_types):
+                  failure = FailureSpec(
+                      failure_type=failure_type,
+                      target_service=None,
+                      intensity=0.5,
+                      duration_seconds=config['duration_minutes'] * 60 // len(failure_types),
+                      start_delay_seconds=i * 60,
+                      parameters={},
+                  )
+                  scenario_spec.failure_sequence.append(failure)
+
+              print(f"⚔️  Starting Shadow Duel Exercise")
+              print(f"   Scenario: {config['scenario']}")
+              print(f"   Severity: {config['severity']}")
+              print(f"   Duration: {config['duration_minutes']} minutes")
+              print(f"   Human Investigators: {config['human_investigators']}")
+              print(f"   AI Agents: {config['ai_agents']}")
+              print(f"   ICS Enabled: {config['enable_ics']}")
+              print(f"   Timeline Capture: {config['capture_timeline']}")
+
+              # Run the Shadow Duel
+              orchestrator = ShadowDuelOrchestrator(
+                  namespace=config['namespace'],
+                  kubeconfig_path=None,
+              )
+
+              result = await orchestrator.run_duel(duel_config, scenario_spec)
+
+              print(f"\n🏁 Shadow Duel Completed!")
+              print(f"   Status: {result.status}")
+              print(f"   Duration: {result.actual_duration_seconds}s")
+              print(f"   Human Findings: {len(result.human_findings)}")
+              print(f"   AI Findings: {len(result.ai_findings)}")
+              print(f"   Consensus Score: {result.consensus_score:.2f}")
+              print(f"   Time to Detection (Human): {result.human_time_to_detection:.1f}s")
+              print(f"   Time to Detection (AI): {result.ai_time_to_detection:.1f}s")
+              print(f"   Time to Resolution (Human): {result.human_time_to_resolution:.1f}s")
+              print(f"   Time to Resolution (AI): {result.ai_time_to_resolution:.1f}s")
+
+              # Save detailed results
+              output = {
+                  "status": result.status,
+                  "scenario": config['scenario'],
+                  "severity": config['severity'],
+                  "duration_seconds": result.actual_duration_seconds,
+                  "human_investigators": config['human_investigators'],
+                  "ai_agents": config['ai_agents'],
+                  "human_findings": result.human_findings,
+                  "ai_findings": result.ai_findings,
+                  "consensus_score": result.consensus_score,
+                  "human_time_to_detection": result.human_time_to_detection,
+                  "ai_time_to_detection": result.ai_time_to_detection,
+                  "human_time_to_resolution": result.human_time_to_resolution,
+                  "ai_time_to_resolution": result.ai_time_to_resolution,
+                  "timeline": result.timeline if config['capture_timeline'] else [],
+                  "ics_events": result.ics_events if config['enable_ics'] else [],
+              }
+
+              with open('/tmp/shadow-duel-result.json', 'w') as f:
+                  json.dump(output, f, indent=2, default=str)
+
+              return output
+
+          result = asyncio.run(run_shadow_duel())
+          print(f"\nRESULT: {json.dumps(result, indent=2, default=str)}")
+          PYEOF
+
+      - name: Generate Shadow Duel Report
+        run: |
+          cat > /tmp/shadow-duel-report.md <<EOF
+          # Shadow Duel Exercise Report
+
+          **Scenario:** ${{ env.SCENARIO }}
+          **Severity:** ${{ env.SEVERITY }}
+          **Environment:** ${{ env.ENVIRONMENT }}
+          **Duration:** ${{ env.DURATION_MINUTES }} minutes
+          **Timestamp:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          **Triggered by:** ${{ github.actor }}
+          **Workflow Run:** ${{ github.run_id }}
+
+          ## Configuration
+          - **Human Investigators:** ${{ env.HUMAN_INVESTIGATORS }}
+          - **AI Agents:** ${{ env.AI_AGENTS }}
+          - **ICS Enabled:** ${{ env.ENABLE_ICS }}
+          - **Timeline Capture:** ${{ env.CAPTURE_TIMELINE }}
+
+          ## Results Summary
+          See workflow logs and artifact for detailed results.
+
+          ## Key Metrics
+          - **Consensus Score:** Measures agreement between human and AI findings (0-1)
+          - **Time to Detection:** How quickly each side identified the root cause
+          - **Time to Resolution:** How quickly each side proposed a valid mitigation
+          - **Finding Quality:** Depth and accuracy of hypotheses generated
+
+          ## Analysis Framework
+
+          ### Human Strengths (Typical)
+          - Contextual understanding of business impact
+          - Creative hypothesis generation for novel failures
+          - Cross-team communication and coordination
+          - Judgment on risk trade-offs
+
+          ### AI Strengths (Typical)
+          - Speed of evidence correlation
+          - Exhaustive search of historical incidents
+          - Consistent application of diagnostic procedures
+          - Parallel hypothesis evaluation
+
+          ## Next Steps
+          1. Review detailed findings in shadow-duel-result.json artifact
+          2. Conduct team retrospective on the exercise
+          3. Update runbooks with new patterns discovered
+          4. Feed results back to RCA Agent training data
+          5. Document lessons learned in knowledge base
+
+          ## Artifacts
+          - Detailed results: shadow-duel-result.json
+          - Investigation timeline: Available in artifact
+          - ICS event log: Available in artifact (if enabled)
+          - RCA Agent analysis: Run rca-agent workflow on same scenario
+          EOF
+
+          cat /tmp/shadow-duel-report.md
+
+      - name: Upload Shadow Duel Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadow-duel-result-${{ env.SCENARIO }}-${{ github.run_number }}
+          path: |
+            /tmp/shadow-duel-result.json
+            /tmp/shadow-duel-report.md
+          retention-days: 30
+
+      - name: Print Summary and Next Steps
+        run: |
+          echo ""
+          echo "=== SHADOW DUEL EXERCISE COMPLETE ==="
+          echo ""
+          echo "📊 Results uploaded as artifact: shadow-duel-result-${{ env.SCENARIO }}-${{ github.run_number }}"
+          echo ""
+          echo "=== KEY INSIGHTS ==="
+          echo "Review the artifact for:"
+          echo "  - Consensus score between human and AI findings"
+          echo "  - Time-to-detection comparison"
+          echo "  - Time-to-resolution comparison"
+          echo "  - Detailed investigation timelines"
+          echo "  - ICS event logs (if enabled)"
+          echo ""
+          echo "=== RECOMMENDED FOLLOW-UP ==="
+          echo "1. Team Retrospective (30 min): Discuss what each approach found/missed"
+          echo "2. Runbook Update: Add any new diagnostic paths discovered"
+          echo "3. Knowledge Base: Ingest this incident for future similarity search"
+          echo "4. RCA Agent Training: Use human findings as labeled data"
+          echo ""
+          echo "=== RE-RUN OPTIONS ==="
+          echo "  # Different scenario"
+          echo "  gh workflow run shadow-duel.yml -f scenario=checkout-cascade-failure"
+          echo ""
+          echo "  # More AI agents"
+          echo "  gh workflow run shadow-duel.yml -f ai_agents=3"
+          echo ""
+          echo "  # Without ICS"
+          echo "  gh workflow run shadow-duel.yml -f enable_ics=false"
+          echo ""
+          echo "  # Longer duration for complex scenarios"
+          echo "  gh workflow run shadow-duel.yml -f duration_minutes=60"
